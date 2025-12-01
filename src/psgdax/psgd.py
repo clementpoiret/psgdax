@@ -29,7 +29,6 @@ class KronState(NamedTuple):
     mu: Optional[Any]
     Qs_preconditioners: Any
     Ls_lipschitz: Optional[Any]  # Lipschitz smoothness constants per Q factor
-    update_counter: jax.Array
     needs_scale_init: jax.Array
     key: jax.Array
 
@@ -789,7 +788,6 @@ def scale_by_kron(
             mu=mu,
             Qs_preconditioners=Qs,
             Ls_lipschitz=Ls,
-            update_counter=jnp.zeros([], jnp.int32),
             needs_scale_init=jnp.array(lazy_init, dtype=jnp.bool_),
             key=key,
         )
@@ -811,8 +809,19 @@ def scale_by_kron(
         mu = None
         momentum_updates = updates
         if state.mu is not None:
-            mu = otu.tree_update_moment(updates, state.mu, b1, 1)
-            momentum_updates = otu.tree_bias_correction(mu, b1, count_inc)
+            # mu = otu.tree_update_moment(updates, state.mu, b1, 1)
+            # momentum_updates = otu.tree_bias_correction(mu, b1, count_inc)
+            beta = jnp.minimum(
+                state.count.astype(jnp.float32)
+                / (1.0 + state.count.astype(jnp.float32)),
+                b1,
+            )
+            mu = jax.tree.map(
+                lambda m, g: beta * m + (1.0 - beta) * g,
+                state.mu,
+                updates,
+            )
+            momentum_updates = mu
 
         # Flatten pytrees
         updates, grads_structure = jax.tree.flatten(updates)
@@ -1099,19 +1108,16 @@ def scale_by_kron(
                 new_Qs = otu.tree_cast(new_Qs, precond_dtype)
                 return new_Qs, new_Ls
 
-        # Update preconditioner deterministically
-        update_counter_inc = safe_int32_increment(state.update_counter)
-        do_update = update_counter_inc >= 1 / update_prob_in
-        update_counter_inc = jnp.where(do_update, 0, update_counter_inc)
-
-        key, subkey = jax.random.split(key)
+        # Update preconditioner stochastically
+        key, key_update_decision, key_update = jax.random.split(key, 3)
+        do_update = jax.random.uniform(key_update_decision) < update_prob_in
 
         # Both branches must return same structure: (Qs, Ls) where Ls is None or list
         Qs, Ls = jax.lax.cond(
             do_update,
             update_preconditioner,
             lambda _key, qs, ls: (qs, ls),  # Identity - preserve structure
-            subkey,
+            key_update,
             Qs,
             Ls,
         )
@@ -1147,7 +1153,6 @@ def scale_by_kron(
             mu=mu,
             Qs_preconditioners=Qs,
             Ls_lipschitz=Ls,
-            update_counter=update_counter_inc,
             needs_scale_init=needs_scale_init,
             key=key_next,
         )
@@ -1183,7 +1188,7 @@ def kron(
     beta_lipschitz: float = 0.9,
     track_lipschitz: bool = True,
     damping: float = 1e-9,
-    grad_clip_max_amp: float = float("inf"),
+    grad_clip_max_amp: float = 1.0,
     key: jax.Array = jax.random.PRNGKey(42),
 ) -> base.GradientTransformationExtraArgs:
     """
@@ -1218,7 +1223,6 @@ def kron(
         damping: float, damping for numerical stability.
         grad_clip_max_amp: float, maximum RMS amplitude for preconditioned gradients.
             Gradients are scaled down if their RMS exceeds this value.
-            Default is inf (no clipping).
         key: jax.Array, PRNGKey
 
     Returns:
