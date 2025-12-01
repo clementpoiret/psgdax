@@ -624,6 +624,7 @@ def scale_by_kron(
     beta_lipschitz: float = 0.9,
     track_lipschitz: bool = True,
     damping: float = 1e-9,
+    grad_clip_max_amp: float = 1.0,
     key: jax.Array = jax.random.PRNGKey(42),
 ) -> base.GradientTransformationExtraArgs:
     """
@@ -657,6 +658,10 @@ def scale_by_kron(
         beta_lipschitz: float, EMA factor for Lipschitz constant estimation.
         track_lipschitz: bool, whether to track L per Q factor (PyTorch-style).
         damping: float, damping for numerical stability.
+        grad_clip_max_amp: float, maximum RMS amplitude for preconditioned gradients.
+            Gradients are scaled down if their RMS exceeds this value.
+            Default is inf (no clipping). PyTorch reference uses 1.0 typically.
+        key: jax.Array, PRNGKey
 
     Returns:
         optax.GradientTransformationExtraArgs
@@ -1120,9 +1125,10 @@ def scale_by_kron(
                 )
             ]
 
-        # Clip preconditioned gradients (RMS should be ~1.0, cap at 1.1)
+        # Clip preconditioned gradients
         def _clip_fn(u):
-            clip_denom = jnp.maximum(1.0, jnp.sqrt(jnp.mean(numerics.abs_sq(u))) / 1.1)
+            rms = jnp.sqrt(jnp.mean(numerics.abs_sq(u)))
+            clip_denom = jnp.maximum(1.0, rms / grad_clip_max_amp)
             return u / clip_denom
 
         precond_gs = jax.tree.map(_clip_fn, precond_gs)
@@ -1177,6 +1183,7 @@ def kron(
     beta_lipschitz: float = 0.9,
     track_lipschitz: bool = True,
     damping: float = 1e-9,
+    grad_clip_max_amp: float = float("inf"),
     key: jax.Array = jax.random.PRNGKey(42),
 ) -> base.GradientTransformationExtraArgs:
     """
@@ -1209,6 +1216,9 @@ def kron(
         beta_lipschitz: float, EMA factor for Lipschitz constant.
         track_lipschitz: bool, whether to track Lipschitz constants.
         damping: float, damping for numerical stability.
+        grad_clip_max_amp: float, maximum RMS amplitude for preconditioned gradients.
+            Gradients are scaled down if their RMS exceeds this value.
+            Default is inf (no clipping).
         key: jax.Array, PRNGKey
 
     Returns:
@@ -1236,6 +1246,7 @@ def kron(
             beta_lipschitz=beta_lipschitz,
             track_lipschitz=track_lipschitz,
             damping=damping,
+            grad_clip_max_amp=grad_clip_max_amp,
             key=key,
         )
     ]
