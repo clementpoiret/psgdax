@@ -610,7 +610,7 @@ def scale_by_kron(
     max_skew_triangular: float = 1.0,
     min_ndim_triangular: int = 2,
     memory_save_mode: Optional[str] = None,
-    momentum_into_precond_update: bool = True,
+    whiten_grad: bool = True,
     preconditioner_lr: float = 0.1,
     preconditioner_init_scale: Optional[float] = 1.0,
     mu_dtype: Optional[Union[str, jnp.dtype]] = None,
@@ -641,8 +641,8 @@ def scale_by_kron(
         min_ndim_triangular: int, minimum number of dimensions a layer needs to have
             triangular preconditioners.
         memory_save_mode: optional str, None, 'one_diag', or 'all_diag'.
-        momentum_into_precond_update: bool, whether to send momentum into preconditioner
-            update instead of raw gradients.
+        whiten_grad: bool, if True the preconditioner whitens the gradient; if False
+            it whitens the momentum. When False, requires b1 > 0.
         preconditioner_lr: float, learning rate for preconditioner.
         preconditioner_init_scale: float or None. If None, scale is computed
             on-the-fly from first gradient as (max(mean(|g|^4)) + damping^4)^(-1/8).
@@ -669,6 +669,17 @@ def scale_by_kron(
     """
     mu_dtype = canonicalize_dtype(mu_dtype)
     precond_dtype = canonicalize_dtype(precond_dtype)
+
+    # Validate whiten_grad setting
+    if not whiten_grad and b1 <= 0:
+        raise ValueError(
+            "Cannot whiten momentum (whiten_grad=False) when momentum is disabled (b1 <= 0)."
+        )
+    if not whiten_grad and jax.process_index() == 0:
+        lr_reduction = int(((1 + b1) / (1 - b1)) ** 0.5)
+        print(
+            f"whiten_grad=False: Recommend reducing learning_rate by ~{lr_reduction}x"
+        )
 
     # Normalize mode
     if isinstance(preconditioner_mode, str):
@@ -894,9 +905,7 @@ def scale_by_kron(
 
         def update_preconditioner(key, Qs, Ls):
             with jax.default_matmul_precision(precond_update_precision):
-                precond_updates_in = (
-                    momentum_updates if momentum_into_precond_update else updates
-                )
+                precond_updates_in = updates if whiten_grad else momentum_updates
 
                 # Create random vectors for damping
                 key, key_noise = jax.random.split(key)
@@ -1177,7 +1186,7 @@ def kron(
     max_skew_triangular: float = 1.0,
     min_ndim_triangular: int = 2,
     memory_save_mode: Optional[str] = None,
-    momentum_into_precond_update: bool = True,
+    whiten_grad: bool = True,
     preconditioner_lr: float = 0.1,
     preconditioner_init_scale: Optional[float] = None,
     mu_dtype: Optional[Union[str, jnp.dtype]] = None,
@@ -1209,7 +1218,8 @@ def kron(
             A dimension uses diagonal preconditioner if size**2 > max_skew * numel.
         min_ndim_triangular: int, minimum dimensions for triangular preconditioners.
         memory_save_mode: optional str, None, 'one_diag', or 'all_diag'.
-        momentum_into_precond_update: bool, use momentum for preconditioner updates.
+        whiten_grad: bool, if True the preconditioner whitens the gradient; if False
+            it whitens the momentum. When False, requires b1 > 0.
         preconditioner_lr: float, learning rate for preconditioner.
         preconditioner_init_scale: float or None. If None, scale is computed
             on-the-fly from first gradient as (max(mean(|g|^4)) + damping^4)^(-1/8).
@@ -1239,7 +1249,7 @@ def kron(
             max_skew_triangular=max_skew_triangular,
             min_ndim_triangular=min_ndim_triangular,
             memory_save_mode=memory_save_mode,
-            momentum_into_precond_update=momentum_into_precond_update,
+            whiten_grad=whiten_grad,
             preconditioner_lr=preconditioner_lr,
             preconditioner_init_scale=preconditioner_init_scale,
             mu_dtype=mu_dtype,
