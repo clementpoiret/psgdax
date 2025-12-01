@@ -30,54 +30,29 @@ class KronState(NamedTuple):
     Qs_preconditioners: Any
     Ls_lipschitz: Optional[Any]  # Lipschitz smoothness constants per Q factor
     update_counter: jax.Array
+    needs_scale_init: jax.Array
     key: jax.Array
 
 
-def init_scale_from_grads(
-    grads,
-    *,
-    noise_scale: float = 1e-9,
-    per_leaf: bool = True,
-    dtype=jnp.float32,
-) -> Union[Any, jnp.ndarray]:
+def _compute_init_scale_from_grads(
+    grads: List[jax.Array],
+    damping: float,
+    dtype: jnp.dtype = jnp.float32,
+) -> jax.Array:
     """
-    Compute whitening init scale(s) from the first batch via:
-        scale = (mean(|g|^2) + noise_scale^2)^(-1/4)
+    Compute whitening init scale from first gradients:
+        scale = (max_leaf(mean(|g|^4)) + damping^4)^(-1/8)
+
+    Matches PyTorch PSGD reference implementation.
     """
 
-    def to_array_or_none(g):
-        if g is None:
-            return None
-        return jnp.asarray(g, dtype=dtype)
+    def leaf_mean_fourth(g: jax.Array) -> jax.Array:
+        return jnp.mean(jnp.power(jnp.abs(g), 4))
 
-    grads = jax.tree_util.tree_map(to_array_or_none, grads)
+    mean_fourths = jnp.stack([leaf_mean_fourth(g) for g in grads])
+    max_mean_fourth = jnp.max(mean_fourths)
 
-    def leaf_scale(g):
-        if g is None:
-            return jnp.asarray(1.0, dtype=dtype)
-        mean_sq = jnp.mean(jnp.square(g))
-        mean_sq = jnp.nan_to_num(mean_sq, nan=0.0, posinf=0.0, neginf=0.0)
-        return jnp.power(mean_sq + (noise_scale**2), -0.25)
-
-    if per_leaf:
-        return jax.tree_util.tree_map(leaf_scale, grads)
-
-    leaves = [g for g in jax.tree_util.tree_leaves(grads) if g is not None]
-    if not leaves:
-        return jnp.asarray(1.0, dtype=dtype)
-
-    sum_sqs = jnp.sum(jnp.stack([jnp.sum(jnp.square(g)) for g in leaves], axis=0))
-    counts = jnp.sum(
-        jnp.stack([jnp.asarray(g.size, dtype=jnp.int32) for g in leaves], axis=0)
-    )
-
-    mean_sq_global = jnp.where(
-        counts > 0,
-        sum_sqs / counts.astype(sum_sqs.dtype),
-        jnp.asarray(0.0, dtype=dtype),
-    )
-    mean_sq_global = jnp.nan_to_num(mean_sq_global, nan=0.0, posinf=0.0, neginf=0.0)
-    return jnp.power(mean_sq_global + (noise_scale**2), -0.25).astype(dtype)
+    return jnp.power(max_mean_fourth + jnp.power(damping, 4), -1.0 / 8.0).astype(dtype)
 
 
 def precond_update_prob_schedule(
@@ -636,7 +611,7 @@ def scale_by_kron(
     memory_save_mode: Optional[str] = None,
     momentum_into_precond_update: bool = True,
     preconditioner_lr: float = 0.1,
-    preconditioner_init_scale: float = 1.0,
+    preconditioner_init_scale: Optional[float] = 1.0,
     mu_dtype: Optional[Union[str, jnp.dtype]] = None,
     precond_dtype: Optional[Union[str, jnp.dtype]] = None,
     precond_update_precision: Optional[str] = "tensorfloat32",
@@ -667,7 +642,8 @@ def scale_by_kron(
         momentum_into_precond_update: bool, whether to send momentum into preconditioner
             update instead of raw gradients.
         preconditioner_lr: float, learning rate for preconditioner.
-        preconditioner_init_scale: float, scale for preconditioner initialization.
+        preconditioner_init_scale: float or None. If None, scale is computed
+            on-the-fly from first gradient as (max(mean(|g|^4)) + damping^4)^(-1/8).
         mu_dtype: optional dtype for momentum accumulator.
         precond_dtype: optional dtype for preconditioner.
         precond_update_precision: str, precision for matmul during preconditioner update.
@@ -700,6 +676,11 @@ def scale_by_kron(
             preconditioner_mode, PreconditionerMode.Q0P5EQ1P5
         )
 
+    # Determine if we need lazy initialization
+    lazy_init = preconditioner_init_scale is None
+    # Use 1.0 as placeholder if lazy init; actual scale applied on first update
+    _init_scale = 1.0 if lazy_init else preconditioner_init_scale
+
     def map_fn(do_map, fn, *args):
         """Maybe map a fn along first axis."""
         if do_map:
@@ -728,7 +709,7 @@ def scale_by_kron(
         Qs = [
             _init_Q_exprs(
                 t[0] if s else t,
-                preconditioner_init_scale,
+                _init_scale,
                 max_size_triangular,
                 max_skew_triangular,
                 min_ndim_triangular,
@@ -782,8 +763,10 @@ def scale_by_kron(
             [q.size * q.dtype.itemsize / (2**20) for q in jax.tree.leaves(Qs)]
         )
         if jax.process_index() == 0:
+            init_msg = "on-the-fly" if lazy_init else f"{_init_scale}"
             print(
-                f"PSGD Preconditioners ({preconditioner_mode.value} mode): "
+                f"PSGD Preconditioners ({preconditioner_mode.value} mode, "
+                f"init_scale={init_msg}): "
                 f"{Qs_n_elements} elements, {Qs_size_MB:.2f} MB"
             )
         if mu is not None:
@@ -802,6 +785,7 @@ def scale_by_kron(
             Qs_preconditioners=Qs,
             Ls_lipschitz=Ls,
             update_counter=jnp.zeros([], jnp.int32),
+            needs_scale_init=jnp.array(lazy_init, dtype=jnp.bool_),
             key=key,
         )
 
@@ -836,11 +820,52 @@ def scale_by_kron(
         if track_lipschitz and state.Ls_lipschitz is not None:
             Ls = grads_structure.flatten_up_to(state.Ls_lipschitz)
 
+        # On-the-fly scale initialization
+        def apply_init_scale(Qs_in):
+            """Compute scale from gradients and apply to Qs."""
+            # Get raw gradients for scale computation (handle scanned layers)
+            grads_for_scale = [
+                g[0] if s else g for g, s in zip(updates, scanned_layers_)
+            ]
+            computed_scale = _compute_init_scale_from_grads(
+                grads_for_scale, damping, precond_dtype or jnp.float32
+            )
+
+            # Apply scale to each Q factor
+            def scale_q_list(q_list, grad, is_scanned):
+                grad_shape = grad[0].shape if is_scanned else grad.shape
+                ndim = len(grad_shape)
+                if ndim == 0:
+                    factor_scale = computed_scale
+                else:
+                    factor_scale = jnp.power(computed_scale, 1.0 / ndim)
+
+                def scale_single_q(q):
+                    return q * factor_scale.astype(q.dtype)
+
+                return [scale_single_q(q) for q in q_list]
+
+            return [
+                scale_q_list(q, g, s)
+                for q, g, s in zip(Qs_in, updates, scanned_layers_)
+            ]
+
+        def no_scale(Qs_in):
+            return Qs_in
+
+        Qs = jax.lax.cond(
+            state.needs_scale_init,
+            apply_init_scale,
+            no_scale,
+            Qs,
+        )
+        needs_scale_init = jnp.array(False, dtype=jnp.bool_)
+
         # Get einsum expressions
         expressions = [
             _init_Q_exprs(
                 t[0] if s else t,
-                preconditioner_init_scale,
+                _init_scale,
                 max_size_triangular,
                 max_skew_triangular,
                 min_ndim_triangular,
@@ -1117,6 +1142,7 @@ def scale_by_kron(
             Qs_preconditioners=Qs,
             Ls_lipschitz=Ls,
             update_counter=update_counter_inc,
+            needs_scale_init=needs_scale_init,
             key=key_next,
         )
 
@@ -1139,7 +1165,7 @@ def kron(
     memory_save_mode: Optional[str] = None,
     momentum_into_precond_update: bool = True,
     preconditioner_lr: float = 0.1,
-    preconditioner_init_scale: float = 1.0,
+    preconditioner_init_scale: Optional[float] = None,
     mu_dtype: Optional[Union[str, jnp.dtype]] = None,
     precond_dtype: Optional[Union[str, jnp.dtype]] = None,
     precond_update_precision: Optional[str] = "tensorfloat32",
@@ -1170,7 +1196,8 @@ def kron(
         memory_save_mode: optional str, None, 'one_diag', or 'all_diag'.
         momentum_into_precond_update: bool, use momentum for preconditioner updates.
         preconditioner_lr: float, learning rate for preconditioner.
-        preconditioner_init_scale: float, initialization scale for preconditioner.
+        preconditioner_init_scale: float or None. If None, scale is computed
+            on-the-fly from first gradient as (max(mean(|g|^4)) + damping^4)^(-1/8).
         mu_dtype: optional dtype for momentum.
         precond_dtype: optional dtype for preconditioner.
         precond_update_precision: str, matmul precision for preconditioner updates.
