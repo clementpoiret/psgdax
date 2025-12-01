@@ -422,7 +422,9 @@ def _update_precond_eq(
                 new_l = jnp.maximum(beta_l * l + (1 - beta_l) * ell, ell)
                 tmp = tmp / new_l
             else:
-                tmp = tmp / _add_tiny(jnp.max(jnp.abs(term1 + term2)))
+                tmp = tmp / _add_tiny(
+                    jnp.max(jnp.real(term1 + term2))
+                )  # or jnp.abs instead of real?
                 new_l = None
 
             new_q = q - tmp * q
@@ -896,18 +898,6 @@ def scale_by_kron(
                     momentum_updates if momentum_into_precond_update else updates
                 )
 
-                # Balance preconditioners about every 100 updates
-                key, key_balance = jax.random.split(key)
-
-                def balance_Qs(Qs: List[List[jax.Array]]):
-                    return [
-                        map_fn(s, _balance_Q, Q) if len(Q) > 1 else Q
-                        for Q, s in zip(Qs, scanned_layers_)
-                    ]
-
-                do_balances = jax.random.uniform(key_balance) < 0.01
-                Qs = jax.lax.cond(do_balances, balance_Qs, lambda qs: qs, Qs)
-
                 # Create random vectors for damping
                 key, key_noise = jax.random.split(key)
                 Vs_keys = jax.random.split(key_noise, len(precond_updates_in))
@@ -917,7 +907,7 @@ def scale_by_kron(
                 ]
 
                 # Apply damping: G + (damping + eps * |G|) * V
-                eps = jnp.finfo(jnp.float32).eps
+                eps = jnp.finfo(precond_updates_in[0].dtype).eps
                 precond_updates_in = jax.tree.map(
                     lambda g, v: g + (damping + eps * jnp.abs(g)) * v,
                     precond_updates_in,
@@ -1106,6 +1096,19 @@ def scale_by_kron(
                         new_Ls = None
 
                 new_Qs = otu.tree_cast(new_Qs, precond_dtype)
+
+                # Balance preconditioners about every 100 updates
+                key, key_balance = jax.random.split(key)
+
+                def balance_Qs(Qs: List[List[jax.Array]]):
+                    return [
+                        map_fn(s, _balance_Q, Q) if len(Q) > 1 else Q
+                        for Q, s in zip(Qs, scanned_layers_)
+                    ]
+
+                do_balances = jax.random.uniform(key_balance) < 0.01
+                new_Qs = jax.lax.cond(do_balances, balance_Qs, lambda qs: qs, new_Qs)
+
                 return new_Qs, new_Ls
 
         # Update preconditioner stochastically
