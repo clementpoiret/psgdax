@@ -241,8 +241,8 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "jax", specifier = ">=0.7.2" },
-    { name = "optax", specifier = ">=0.2.4" },
+    { name = "jax", specifier = ">=0.6.2" },
+    { name = "optax", specifier = ">=0.2.0" },
 ]
 
 [[package]]
