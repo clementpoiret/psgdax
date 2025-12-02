@@ -119,11 +119,9 @@ preconditioner update.
 
 ### Kronecker Decomposition
 
-For a tensor parameter of shape $(n_1, n_2, \\dots)$, PSGD approximates the Hessian inverse as a Kronecker product of
-smaller matrices $Q = Q_1 \\otimes Q_2 \\dots$.
+For a tensor parameter of shape $(n_1, n_2, \\dots)$, PSGD approximates the Hessian inverse as a Kronecker product of smaller matrices $Q = Q_1 \\otimes Q_2 \\dots$.
 
-- Dimensions where $n_i > \\text{max_size}$ or $n_i^2 > \\text{max_skew} \\cdot \\text{numel}$ are approximated via
-  diagonal matrices.
+- Dimensions where $n_i >$ `max_size` or $n_i^2 >$ `max_skew` $\\cdot$ `numel` are approximated via diagonal matrices.
 - Dimensions fitting the criteria utilize full dense matrices.
 
 ### Eigenvalue Bounds
