@@ -612,7 +612,7 @@ def scale_by_kron(
     memory_save_mode: Optional[str] = None,
     whiten_grad: bool = True,
     preconditioner_lr: float = 0.1,
-    preconditioner_init_scale: Optional[float] = 1.0,
+    preconditioner_init_scale: Optional[float] = None,
     mu_dtype: Optional[Union[str, jnp.dtype]] = None,
     precond_dtype: Optional[Union[str, jnp.dtype]] = None,
     precond_update_precision: Optional[str] = "tensorfloat32",
@@ -620,7 +620,6 @@ def scale_by_kron(
     scanned_layers: Optional[base.Params] = None,
     lax_map_scanned_layers: bool = False,
     lax_map_batch_size: int = 8,
-    # New parameters for mode selection
     preconditioner_mode: Union[str, PreconditionerMode] = PreconditionerMode.Q0P5EQ1P5,
     beta_lipschitz: float = 0.9,
     track_lipschitz: bool = True,
